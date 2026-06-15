@@ -1,0 +1,108 @@
+rules:
+  - name: sql_injection_attempt
+    description: 检测SQL注入攻击尝试
+    severity: critical
+    category: injection
+    type: sql_injection
+    enabled: true
+
+  - name: xss_attempt
+    description: 检测XSS跨站脚本攻击尝试
+    severity: high
+    category: injection
+    type: xss
+    enabled: true
+
+  - name: path_traversal
+    description: 检测目录遍历/路径遍历攻击
+    severity: high
+    category: injection
+    type: path_injection
+    enabled: true
+
+  - name: scanner_detected
+    description: 检测安全扫描器访问
+    severity: medium
+    category: recon
+    type: scanner
+    enabled: true
+
+  - name: sensitive_path_access
+    description: 访问敏感路径
+    severity: medium
+    category: information_disclosure
+    type: regex
+    pattern: "(\\.env|\\.git|\\.svn|\\.hg|wp-config|phpmyadmin|admin|setup)"
+    field: path
+    enabled: true
+
+  - name: brute_force_login
+    description: 登录接口暴力破解尝试
+    severity: high
+    category: brute_force
+    type: regex
+    pattern: "(login|signin|auth|wp-login)"
+    field: path
+    enabled: true
+
+  - name: file_upload_attempt
+    description: 文件上传攻击尝试
+    severity: high
+    category: file_upload
+    type: regex
+    pattern: "(upload|fileupload|phpupload)"
+    field: path
+    enabled: true
+
+  - name: command_injection
+    description: 命令注入攻击尝试
+    severity: critical
+    category: injection
+    type: regex
+    pattern: "(;|\\|\\||`|\\$\\(|system\\(|exec\\(|shell_exec\\()\\s*(ls|cat|whoami|id|uname|rm|cp|wget|curl)"
+    field: path
+    enabled: true
+
+  - name: server_error_5xx
+    description: 服务器错误状态码
+    severity: medium
+    category: status
+    type: status_code
+    status_codes:
+      - 500
+      - 502
+      - 503
+      - 504
+    enabled: true
+
+  - name: client_error_4xx
+    description: 客户端错误状态码
+    severity: low
+    category: status
+    type: status_code
+    status_codes:
+      - 400
+      - 401
+      - 403
+      - 404
+      - 405
+      - 429
+    enabled: true
+
+  - name: suspicious_user_agent
+    description: 可疑的User-Agent
+    severity: low
+    category: recon
+    type: regex
+    pattern: "(sqlmap|nikto|nmap|nessus|acunetix|burp|dirbuster|gobuster|wfuzz|masscan|python-requests|httrack|sqlninja)"
+    field: user_agent
+    enabled: true
+
+  - name: webshell_detection
+    description: WebShell文件访问检测
+    severity: critical
+    category: webshell
+    type: regex
+    pattern: "(cmd\\.php|shell\\.php|backdoor|webshell|eval\\(|assert\\(|base64_decode)"
+    field: path
+    enabled: true
