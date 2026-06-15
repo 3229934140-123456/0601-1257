@@ -1,10 +1,12 @@
 import sys
 import os
 import re
+import csv
+import json
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from collections import deque, defaultdict
-from typing import List, Optional
+from typing import List, Optional, Dict
 
 import click
 from colorama import init, Fore, Style
@@ -88,6 +90,51 @@ def _print_entry(entry: LogEntry, idx: int = 0, keywords: List[str] = None,
                    f"{entry.path}")
 
 
+def _apply_profile(config, profile_name, paths=None, log_format=None, start=None,
+                   end=None, rules_file=None, keyword=None, ips=None,
+                   status_codes=None, regex=None):
+    """从配置档案加载参数，命令行显式指定的参数优先级更高"""
+    prof = config.load_profile(profile_name)
+    if not prof:
+        click.echo(Fore.YELLOW + f"警告: 配置档案 '{profile_name}' 不存在" + Style.RESET_ALL)
+        return paths, log_format, start, end, rules_file, keyword, ips, status_codes, regex
+
+    if not paths and "paths" in prof:
+        paths = tuple(prof["paths"]) if isinstance(prof["paths"], list) else (prof["paths"],)
+    if not log_format and "format" in prof:
+        log_format = prof["format"]
+    if not start and "start" in prof:
+        start = prof["start"]
+    if not end and "end" in prof:
+        end = prof["end"]
+    if not rules_file and "rules_file" in prof:
+        rules_file = prof["rules_file"]
+    if not keyword and "keyword" in prof:
+        keyword = prof["keyword"]
+    if not ips and "ips" in prof:
+        v = prof["ips"]
+        ips = ",".join(v) if isinstance(v, list) else v
+    if not status_codes and "status_codes" in prof:
+        v = prof["status_codes"]
+        status_codes = ",".join(str(x) for x in v) if isinstance(v, list) else str(v)
+    if not regex and "regex" in prof:
+        regex = prof["regex"]
+
+    return paths, log_format, start, end, rules_file, keyword, ips, status_codes, regex
+
+
+def _parse_status_list(status_codes):
+    if not status_codes:
+        return None
+    return [int(s.strip()) for s in str(status_codes).split(",") if s.strip()]
+
+
+def _parse_ip_list(ips):
+    if not ips:
+        return None
+    return [ip.strip() for ip in str(ips).split(",") if ip.strip()]
+
+
 def _load_entries(paths: List[str], log_format: str, start: str = None,
                   end: str = None, keyword: str = None, regex: str = None,
                   status_codes: List[int] = None, ips: List[str] = None,
@@ -157,21 +204,13 @@ def scan(ctx, paths, log_format, start, end, rules_file, no_default_rules,
     """扫描日志，检测异常访问和攻击行为"""
     config = ctx.obj["config"]
 
+    p_keyword = None
+    p_ips = None
+    p_status = None
+
     if profile:
-        prof = config.load_profile(profile)
-        if prof:
-            if not paths and "paths" in prof:
-                paths = tuple(prof["paths"])
-            if not log_format and "format" in prof:
-                log_format = prof["format"]
-            if not start and "start" in prof:
-                start = prof["start"]
-            if not end and "end" in prof:
-                end = prof["end"]
-            if not rules_file and "rules_file" in prof:
-                rules_file = prof["rules_file"]
-        else:
-            click.echo(Fore.YELLOW + f"警告: 配置档案 '{profile}' 不存在" + Style.RESET_ALL)
+        paths, log_format, start, end, rules_file, p_keyword, p_ips, p_status, _ = _apply_profile(
+            config, profile, paths, log_format, start, end, rules_file)
 
     log_format = log_format or config.get("default_format", "combined")
     page_size = page_size or config.get("page_size", 20)
@@ -184,7 +223,11 @@ def scan(ctx, paths, log_format, start, end, rules_file, no_default_rules,
         click.echo(Fore.RED + "请指定日志文件或目录路径" + Style.RESET_ALL)
         sys.exit(1)
 
-    entries = _load_entries(list(paths), log_format, start, end)
+    status_list = _parse_status_list(p_status)
+    ip_list = _parse_ip_list(p_ips)
+
+    entries = _load_entries(list(paths), log_format, start, end,
+                            keyword=p_keyword, status_codes=status_list, ips=ip_list)
 
     engine = RuleEngine()
     if not no_default_rules:
@@ -318,20 +361,9 @@ def filter(ctx, paths, log_format, start, end, keyword, regex, field,
     config = ctx.obj["config"]
 
     if profile:
-        prof = config.load_profile(profile)
-        if prof:
-            if not paths and "paths" in prof:
-                paths = tuple(prof["paths"])
-            if not log_format and "format" in prof:
-                log_format = prof["format"]
-            if not start and "start" in prof:
-                start = prof["start"]
-            if not end and "end" in prof:
-                end = prof["end"]
-            if not keyword and "keyword" in prof:
-                keyword = prof["keyword"]
-        else:
-            click.echo(Fore.YELLOW + f"警告: 配置档案 '{profile}' 不存在" + Style.RESET_ALL)
+        paths, log_format, start, end, _, keyword, ips, status_codes, regex = _apply_profile(
+            config, profile, paths, log_format, start, end,
+            keyword=keyword, ips=ips, status_codes=status_codes, regex=regex)
 
     log_format = log_format or config.get("default_format", "combined")
     page_size = page_size or config.get("page_size", 20)
@@ -344,13 +376,8 @@ def filter(ctx, paths, log_format, start, end, keyword, regex, field,
         click.echo(Fore.RED + "请指定日志文件或目录路径" + Style.RESET_ALL)
         sys.exit(1)
 
-    status_list = None
-    if status_codes:
-        status_list = [int(s.strip()) for s in status_codes.split(",") if s.strip()]
-
-    ip_list = None
-    if ips:
-        ip_list = [ip.strip() for ip in ips.split(",") if ip.strip()]
+    status_list = _parse_status_list(status_codes)
+    ip_list = _parse_ip_list(ips)
 
     highlight_list = list(highlight)
     if keyword and keyword not in highlight_list:
@@ -423,19 +450,13 @@ def top(ctx, paths, log_format, start, end, stat_type, limit, min_count,
     """按IP、状态码、路径等聚合统计，显示TOP排名和高频请求"""
     config = ctx.obj["config"]
 
+    p_keyword = None
+    p_ips = None
+    p_status = None
+
     if profile:
-        prof = config.load_profile(profile)
-        if prof:
-            if not paths and "paths" in prof:
-                paths = tuple(prof["paths"])
-            if not log_format and "format" in prof:
-                log_format = prof["format"]
-            if not start and "start" in prof:
-                start = prof["start"]
-            if not end and "end" in prof:
-                end = prof["end"]
-        else:
-            click.echo(Fore.YELLOW + f"警告: 配置档案 '{profile}' 不存在" + Style.RESET_ALL)
+        paths, log_format, start, end, _, p_keyword, p_ips, p_status, _ = _apply_profile(
+            config, profile, paths, log_format, start, end)
 
     log_format = log_format or config.get("default_format", "combined")
 
@@ -447,7 +468,11 @@ def top(ctx, paths, log_format, start, end, stat_type, limit, min_count,
         click.echo(Fore.RED + "请指定日志文件或目录路径" + Style.RESET_ALL)
         sys.exit(1)
 
-    entries = _load_entries(list(paths), log_format, start, end)
+    status_list = _parse_status_list(p_status)
+    ip_list = _parse_ip_list(p_ips)
+
+    entries = _load_entries(list(paths), log_format, start, end, keyword=p_keyword,
+                            status_codes=status_list, ips=ip_list)
 
     if high_freq:
         click.echo(Fore.CYAN + Style.BRIGHT + "=" * 60 + Style.RESET_ALL)
@@ -580,18 +605,8 @@ def trace(ctx, ip, paths, log_format, start, end, limit, page, page_size,
     config = ctx.obj["config"]
 
     if profile:
-        prof = config.load_profile(profile)
-        if prof:
-            if not paths and "paths" in prof:
-                paths = tuple(prof["paths"])
-            if not log_format and "format" in prof:
-                log_format = prof["format"]
-            if not start and "start" in prof:
-                start = prof["start"]
-            if not end and "end" in prof:
-                end = prof["end"]
-        else:
-            click.echo(Fore.YELLOW + f"警告: 配置档案 '{profile}' 不存在" + Style.RESET_ALL)
+        paths, log_format, start, end, _, _, _, _, _ = _apply_profile(
+            config, profile, paths, log_format, start, end)
 
     log_format = log_format or config.get("default_format", "combined")
     page_size = page_size or config.get("page_size", 20)
@@ -698,20 +713,9 @@ def export(ctx, paths, log_format, start, end, keyword, regex, status_codes,
     config = ctx.obj["config"]
 
     if profile:
-        prof = config.load_profile(profile)
-        if prof:
-            if not paths and "paths" in prof:
-                paths = tuple(prof["paths"])
-            if not log_format and "format" in prof:
-                log_format = prof["format"]
-            if not start and "start" in prof:
-                start = prof["start"]
-            if not end and "end" in prof:
-                end = prof["end"]
-            if not rules_file and "rules_file" in prof:
-                rules_file = prof["rules_file"]
-        else:
-            click.echo(Fore.YELLOW + f"警告: 配置档案 '{profile}' 不存在" + Style.RESET_ALL)
+        paths, log_format, start, end, rules_file, keyword, ips, status_codes, regex = _apply_profile(
+            config, profile, paths, log_format, start, end, rules_file,
+            keyword=keyword, ips=ips, status_codes=status_codes, regex=regex)
 
     log_format = log_format or config.get("default_format", "combined")
     export_dir = output_dir or config.get("export_dir")
@@ -724,13 +728,8 @@ def export(ctx, paths, log_format, start, end, keyword, regex, status_codes,
         click.echo(Fore.RED + "请指定日志文件或目录路径" + Style.RESET_ALL)
         sys.exit(1)
 
-    status_list = None
-    if status_codes:
-        status_list = [int(s.strip()) for s in status_codes.split(",") if s.strip()]
-
-    ip_list = None
-    if ips:
-        ip_list = [ip.strip() for ip in ips.split(",") if ip.strip()]
+    status_list = _parse_status_list(status_codes)
+    ip_list = _parse_ip_list(ips)
 
     entries = _load_entries(
         list(paths), log_format, start, end, keyword, regex, status_list, ip_list
@@ -877,16 +876,10 @@ def watch(ctx, paths, log_format, rules_file, no_default_rules, severity,
     config = ctx.obj["config"]
 
     if profile:
-        prof = config.load_profile(profile)
-        if prof:
-            if not paths and "paths" in prof:
-                paths = tuple(prof["paths"])
-            if not log_format and "format" in prof:
-                log_format = prof["format"]
-            if not rules_file and "rules_file" in prof:
-                rules_file = prof["rules_file"]
-        else:
-            click.echo(Fore.YELLOW + f"警告: 配置档案 '{profile}' 不存在" + Style.RESET_ALL)
+        paths, log_format, _, _, rules_file, _, prof_ips, _, _ = _apply_profile(
+            config, profile, paths, log_format, rules_file=rules_file)
+        if not watch_ips and prof_ips:
+            watch_ips = prof_ips
 
     log_format = log_format or config.get("default_format", "combined")
     default_paths = config.get("default_log_paths", [])
@@ -949,9 +942,16 @@ def watch(ctx, paths, log_format, rules_file, no_default_rules, severity,
     click.echo(Fore.YELLOW + "  按 Ctrl+C 退出监控" + Style.RESET_ALL)
     click.echo()
 
+    ALERT_MERGE_WINDOW = 30
+
+    ip_alert_buffer: Dict[str, List[RuleMatch]] = defaultdict(list)
+    ip_last_flush: Dict[str, float] = {}
+    all_alerts: List[RuleMatch] = []
+
     try:
         while True:
             batch_matches: List[RuleMatch] = []
+            now_ts = time.time()
 
             for fp in files:
                 try:
@@ -1005,49 +1005,85 @@ def watch(ctx, paths, log_format, rules_file, no_default_rules, severity,
                                     continue
                                 batch_matches.append(m)
                                 total_alerts += 1
+                                all_alerts.append(m)
+                                ip = m.entry.ip
 
-                                sev_color = SEVERITY_COLORS.get(m.rule.severity, "")
-                                sev_tag = SEVERITY_TAGS.get(m.rule.severity, "")
-                                ts = m.entry.timestamp.strftime("%H:%M:%S") if m.entry.timestamp else "??:??:??"
-                                disp = get_disposition(m.rule.name)
-                                click.echo(
-                                    f"  {sev_color}{sev_tag}{Style.RESET_ALL} "
-                                    f"{Fore.CYAN}[{ts}]{Style.RESET_ALL} "
-                                    f"{m.entry.ip:15s}  {m.entry.method:4s} "
-                                    f"{m.entry.status:>3d}  {m.rule.name}"
-                                )
-                                click.echo(
-                                    f"       {m.entry.path[:70]}"
-                                )
                                 if m.rule.severity in ("critical", "high"):
+                                    sev_color = SEVERITY_COLORS.get(m.rule.severity, "")
+                                    sev_tag = SEVERITY_TAGS.get(m.rule.severity, "")
+                                    ts = m.entry.timestamp.strftime("%H:%M:%S") if m.entry.timestamp else "??:??:??"
+                                    disp = get_disposition(m.rule.name)
+                                    click.echo(
+                                        f"  {sev_color}{sev_tag}{Style.RESET_ALL} "
+                                        f"{Fore.CYAN}[{ts}]{Style.RESET_ALL} "
+                                        f"{m.entry.ip:15s}  {m.entry.method:4s} "
+                                        f"{m.entry.status:>3d}  {m.rule.name}"
+                                    )
+                                    click.echo(f"       {m.entry.path[:70]}")
                                     click.echo(
                                         f"       {Fore.MAGENTA}威胁:{Style.RESET_ALL} "
                                         f"{disp['threat']} | "
                                         f"{Fore.MAGENTA}建议:{Style.RESET_ALL} "
                                         f"{disp['actions'][0]}"
                                     )
-                                click.echo()
+                                    click.echo()
+                                else:
+                                    ip_alert_buffer[ip].append(m)
+                                    ip_last_flush[ip] = now_ts
 
                     except (IOError, OSError):
                         continue
+
+            for ip in list(ip_alert_buffer.keys()):
+                if not ip_alert_buffer[ip]:
+                    continue
+                last_t = ip_last_flush.get(ip, 0)
+                if now_ts - last_t >= ALERT_MERGE_WINDOW or len(ip_alert_buffer[ip]) >= 5:
+                    buffered = ip_alert_buffer[ip]
+                    click.echo(
+                        Fore.YELLOW + f"  [摘要] IP {ip} "
+                        f"最近{ALERT_MERGE_WINDOW}s内 {len(buffered)} 条中低危告警:" +
+                        Style.RESET_ALL
+                    )
+                    attack_counts = defaultdict(int)
+                    for m in buffered:
+                        attack_counts[m.rule.name] += 1
+                    for name, cnt in sorted(attack_counts.items(), key=lambda x: x[1], reverse=True):
+                        click.echo(f"       {name}: {cnt}次")
+                    click.echo()
+                    ip_alert_buffer[ip] = []
 
             if not no_stats and (total_requests % 50 == 0 or total_alerts % 5 == 0) and total_requests > 0:
                 elapsed = (datetime.now() - start_time).total_seconds()
                 click.echo(
                     Fore.CYAN + Style.DIM +
-                    f"  ── 统计: 已处理 {total_requests} 条 | "
+                    f"  -- 统计: 已处理 {total_requests} 条 | "
                     f"告警 {total_alerts} 条 | "
-                    f"运行 {int(elapsed)}s ──" +
+                    f"运行 {int(elapsed)}s --" +
                     Style.RESET_ALL
                 )
 
             time.sleep(interval)
 
     except KeyboardInterrupt:
-        click.echo()
+        for ip in ip_alert_buffer:
+            if ip_alert_buffer[ip]:
+                buffered = ip_alert_buffer[ip]
+                click.echo(
+                    Fore.YELLOW + f"  [摘要] IP {ip} "
+                    f"剩余 {len(buffered)} 条中低危告警:" +
+                    Style.RESET_ALL
+                )
+                attack_counts = defaultdict(int)
+                for m in buffered:
+                    attack_counts[m.rule.name] += 1
+                for name, cnt in sorted(attack_counts.items(), key=lambda x: x[1], reverse=True):
+                    click.echo(f"       {name}: {cnt}次")
+                click.echo()
+
         click.echo()
         click.echo(Fore.CYAN + Style.BRIGHT + "=" * 70 + Style.RESET_ALL)
-        click.echo(Fore.CYAN + Style.BRIGHT + "  监控结束" + Style.RESET_ALL)
+        click.echo(Fore.CYAN + Style.BRIGHT + "  监控结束 - 告警小结" + Style.RESET_ALL)
         click.echo(Fore.CYAN + Style.BRIGHT + "=" * 70 + Style.RESET_ALL)
         elapsed = (datetime.now() - start_time).total_seconds()
         click.echo()
@@ -1057,6 +1093,447 @@ def watch(ctx, paths, log_format, rules_file, no_default_rules, severity,
         if alerted_ips:
             click.echo(f"  高频IP:   {', '.join(sorted(alerted_ips))}")
         click.echo()
+
+        if all_alerts:
+            sevs = defaultdict(int)
+            attacks = defaultdict(int)
+            alert_ips_map = defaultdict(int)
+            for m in all_alerts:
+                sevs[m.rule.severity] += 1
+                attacks[m.rule.name] += 1
+                alert_ips_map[m.entry.ip] += 1
+
+            click.echo(Fore.YELLOW + "  告警级别分布:" + Style.RESET_ALL)
+            for sev in ["critical", "high", "medium", "low"]:
+                if sevs[sev] > 0:
+                    color = SEVERITY_COLORS.get(sev, "")
+                    tag = SEVERITY_TAGS.get(sev, "")
+                    click.echo(f"    {color}{tag}{Style.RESET_ALL} {sevs[sev]}条")
+
+            click.echo()
+            click.echo(Fore.YELLOW + "  TOP攻击类型:" + Style.RESET_ALL)
+            for name, cnt in sorted(attacks.items(), key=lambda x: x[1], reverse=True)[:5]:
+                click.echo(f"    {name}: {cnt}次")
+
+            click.echo()
+            click.echo(Fore.YELLOW + "  TOP告警源IP:" + Style.RESET_ALL)
+            for ip, cnt in sorted(alert_ips_map.items(), key=lambda x: x[1], reverse=True)[:8]:
+                click.echo(f"    {ip:18s} {cnt}条")
+
+            critical_m = [m for m in all_alerts if m.rule.severity == "critical"]
+            high_m = [m for m in all_alerts if m.rule.severity == "high"]
+            if critical_m or high_m:
+                click.echo()
+                click.echo(Fore.RED + Style.BRIGHT + "  高危处置建议:" + Style.RESET_ALL)
+                shown = set()
+                for m in (critical_m + high_m):
+                    if m.rule.name in shown:
+                        continue
+                    shown.add(m.rule.name)
+                    disp = get_disposition(m.rule.name)
+                    click.echo(f"    * {disp['threat']}")
+                    click.echo(f"      {disp['actions'][0]}")
+                    if len(shown) >= 3:
+                        break
+        click.echo()
+
+
+@cli.command()
+@click.argument("paths", nargs=-1)
+@click.option("-f", "--format", "log_format", default=None, help="日志格式")
+@click.option("--start", default=None, help="开始时间")
+@click.option("--end", default=None, help="结束时间")
+@click.option("-r", "--rules", "rules_file", default=None, help="异常规则文件")
+@click.option("--no-default-rules", is_flag=True, help="不加载内置规则")
+@click.option("-n", "--name", "incident_name", default=None, help="事件名称(默认自动生成)")
+@click.option("-o", "--output-dir", default=None, help="事件包输出目录")
+@click.option("--profile", default=None, help="使用配置档案")
+@click.pass_context
+def incident(ctx, paths, log_format, start, end, rules_file, no_default_rules,
+             incident_name, output_dir, profile):
+    """将扫描结果打包为可复盘的事件目录，方便交接班"""
+    import shutil
+    config = ctx.obj["config"]
+
+    if profile:
+        paths, log_format, start, end, rules_file, _, _, _, _ = _apply_profile(
+            config, profile, paths, log_format, start, end, rules_file)
+
+    log_format = log_format or config.get("default_format", "combined")
+    default_paths = config.get("default_log_paths", [])
+    if not paths and default_paths:
+        paths = tuple(default_paths)
+    if not paths:
+        click.echo(Fore.RED + "请指定日志文件或目录路径" + Style.RESET_ALL)
+        sys.exit(1)
+
+    entries = _load_entries(list(paths), log_format, start, end)
+
+    engine = RuleEngine()
+    if not no_default_rules:
+        engine.load_default_rules()
+    if rules_file:
+        engine.load_rules_file(rules_file)
+    else:
+        for rf in config.get("rules_files", []):
+            engine.load_rules_file(rf)
+
+    matches = engine.scan_entries(entries)
+    data_summary = compute_summary(entries)
+
+    now = datetime.now()
+    if not incident_name:
+        incident_name = f"INC-{now.strftime('%Y%m%d-%H%M%S')}"
+
+    inc_dir = os.path.join(output_dir or config.get("export_dir") or ".", incident_name)
+    os.makedirs(inc_dir, exist_ok=True)
+
+    # summary.txt
+    grouped = group_matches(matches)
+    critical_count = sum(1 for m in matches if m.rule.severity == "critical")
+    high_count = sum(1 for m in matches if m.rule.severity == "high")
+    risk = risk_level(len(matches), critical_count, high_count)
+
+    with open(os.path.join(inc_dir, "summary.txt"), "w", encoding="utf-8") as f:
+        f.write(f"事件名称: {incident_name}\n")
+        f.write(f"生成时间: {now.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"风险等级: {risk}\n")
+        f.write(f"日志条目: {data_summary['total_requests']}\n")
+        f.write(f"告警总数: {len(matches)}\n")
+        f.write(f"涉及IP:   {data_summary['unique_ips']}\n")
+        f.write(f"时间范围: {data_summary['time_range_start']} ~ {data_summary['time_range_end']}\n\n")
+
+        f.write("=" * 60 + "\n")
+        f.write("攻击类型统计\n")
+        f.write("=" * 60 + "\n")
+        for attack_name, attack_matches in sorted(grouped["by_attack"].items(),
+                                                   key=lambda x: len(x[1]), reverse=True):
+            disp = get_disposition(attack_name)
+            uniq_ips = sorted(set(m.entry.ip for m in attack_matches))
+            f.write(f"\n  [{attack_name}] {len(attack_matches)}次\n")
+            f.write(f"    威胁: {disp['threat']}\n")
+            f.write(f"    影响: {disp['impact']}\n")
+            f.write(f"    源IP: {', '.join(uniq_ips[:10])}\n")
+            for a in disp["actions"][:3]:
+                f.write(f"    * {a}\n")
+
+        f.write("\n" + "=" * 60 + "\n")
+        f.write("攻击源IP分析\n")
+        f.write("=" * 60 + "\n")
+        for ip, ip_matches in sorted(grouped["by_ip"].items(),
+                                      key=lambda x: len(x[1]), reverse=True):
+            attacks = sorted(set(m.rule.name for m in ip_matches))
+            sevs = defaultdict(int)
+            for m in ip_matches:
+                sevs[m.rule.severity] += 1
+            f.write(f"\n  {ip} - {len(ip_matches)}条告警\n")
+            f.write(f"    级别: {dict(sevs)}\n")
+            f.write(f"    攻击: {', '.join(attacks[:6])}\n")
+
+        f.write("\n" + "=" * 60 + "\n")
+        f.write("受影响路径\n")
+        f.write("=" * 60 + "\n")
+        for path, path_matches in sorted(grouped["by_path"].items(),
+                                          key=lambda x: len(x[1]), reverse=True)[:20]:
+            uniq_ips = sorted(set(m.entry.ip for m in path_matches))
+            f.write(f"  {path} - {len(path_matches)}次 | IP: {', '.join(uniq_ips[:5])}\n")
+
+    # disposition.txt
+    with open(os.path.join(inc_dir, "disposition.txt"), "w", encoding="utf-8") as f:
+        f.write(f"事件: {incident_name} | 风险: {risk}\n")
+        f.write("=" * 60 + "\n\n")
+        displayed = set()
+        for attack_name, attack_matches in sorted(grouped["by_attack"].items(),
+                                                   key=lambda x: len(x[1]), reverse=True):
+            if attack_name in displayed:
+                continue
+            displayed.add(attack_name)
+            disp = get_disposition(attack_name)
+            uniq_ips = sorted(set(m.entry.ip for m in attack_matches))
+            f.write(f"【{disp['threat']}】\n")
+            f.write(f"  风险影响: {disp['impact']}\n")
+            f.write(f"  涉及IP ({len(uniq_ips)}): {', '.join(uniq_ips[:10])}\n")
+            f.write(f"  处置步骤:\n")
+            for i, a in enumerate(disp["actions"], 1):
+                f.write(f"    {i}. {a}\n")
+            f.write("\n")
+
+        ban_ips = sorted(grouped["by_ip"].keys(),
+                         key=lambda ip: len(grouped["by_ip"][ip]), reverse=True)
+        if ban_ips:
+            f.write("建议封禁IP:\n")
+            for ip in ban_ips:
+                cnt = len(grouped["by_ip"][ip])
+                f.write(f"  - {ip} ({cnt}条告警)\n")
+
+    # alerts.csv
+    with open(os.path.join(inc_dir, "alerts.csv"), "w", newline="",
+              encoding="utf-8-sig") as f:
+        writer = csv.writer(f)
+        writer.writerow(["严重级别", "规则名称", "时间", "源IP", "方法", "状态码",
+                         "路径", "详情", "威胁描述"])
+        for m in matches:
+            disp = get_disposition(m.rule.name)
+            ts = m.entry.timestamp.strftime("%Y-%m-%d %H:%M:%S") if m.entry.timestamp else ""
+            writer.writerow([
+                m.rule.severity, m.rule.name, ts, m.entry.ip,
+                m.entry.method, m.entry.status, m.entry.path,
+                m.detail, disp["threat"]
+            ])
+
+    # raw_logs.log
+    with open(os.path.join(inc_dir, "raw_logs.log"), "w", encoding="utf-8") as f:
+        alert_ips = set(m.entry.ip for m in matches)
+        alert_paths = set(m.entry.path for m in matches)
+        for e in entries:
+            if e.ip in alert_ips or e.path in alert_paths:
+                f.write(e.raw + "\n")
+
+    # metadata.json
+    meta = {
+        "incident_name": incident_name,
+        "created_at": now.strftime("%Y-%m-%d %H:%M:%S"),
+        "risk_level": risk,
+        "log_sources": list(paths) if paths else [],
+        "time_range": {
+            "start": data_summary["time_range_start"],
+            "end": data_summary["time_range_end"],
+        },
+        "stats": {
+            "total_entries": data_summary["total_requests"],
+            "total_alerts": len(matches),
+            "critical": critical_count,
+            "high": high_count,
+            "unique_ips": data_summary["unique_ips"],
+        },
+        "files": ["summary.txt", "disposition.txt", "alerts.csv", "raw_logs.log", "metadata.json"],
+    }
+    with open(os.path.join(inc_dir, "metadata.json"), "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+
+    click.echo(Fore.GREEN + f"事件包已生成: {inc_dir}" + Style.RESET_ALL)
+    click.echo(f"  风险等级: {risk}")
+    click.echo(f"  告警总数: {len(matches)}")
+    click.echo(f"  包含文件:")
+    click.echo(f"    summary.txt      - 事件摘要与攻击分析")
+    click.echo(f"    disposition.txt  - 处置建议(可复制到工单)")
+    click.echo(f"    alerts.csv       - 告警明细表")
+    click.echo(f"    raw_logs.log     - 关联原始日志片段")
+    click.echo(f"    metadata.json    - 元数据")
+
+
+@cli.command()
+@click.argument("paths", nargs=-1)
+@click.option("-f", "--format", "log_format", default=None, help="日志格式")
+@click.option("--start", default=None, help="当前时段开始时间")
+@click.option("--end", default=None, help="当前时段结束时间")
+@click.option("--baseline-start", default=None, help="基线时段开始时间")
+@click.option("--baseline-end", default=None, help="基线时段结束时间")
+@click.option("--shift", default="1d",
+              help="时间偏移(如1d=1天,2h=2小时),自动推算基线时段")
+@click.option("-r", "--rules", "rules_file", default=None, help="异常规则文件")
+@click.option("--no-default-rules", is_flag=True, help="不加载内置规则")
+@click.option("-n", "--limit", default=10, help="每类显示TOP N")
+@click.option("--profile", default=None, help="使用配置档案")
+@click.pass_context
+def baseline(ctx, paths, log_format, start, end, baseline_start, baseline_end,
+             shift, rules_file, no_default_rules, limit, profile):
+    """基线对比: 比较两个时段的日志差异，发现新增威胁和异常增长"""
+    config = ctx.obj["config"]
+
+    if profile:
+        paths, log_format, start, end, rules_file, _, _, _, _ = _apply_profile(
+            config, profile, paths, log_format, start, end, rules_file)
+
+    log_format = log_format or config.get("default_format", "combined")
+    default_paths = config.get("default_log_paths", [])
+    if not paths and default_paths:
+        paths = tuple(default_paths)
+    if not paths:
+        click.echo(Fore.RED + "请指定日志文件或目录路径" + Style.RESET_ALL)
+        sys.exit(1)
+
+    if not baseline_start or not baseline_end:
+        bl_start, bl_end = _shift_time(start, end, shift)
+        if not bl_start or not bl_end:
+            click.echo(Fore.RED + "请指定 --start/--end 或 --baseline-start/--baseline-end" + Style.RESET_ALL)
+            sys.exit(1)
+        baseline_start = bl_start
+        baseline_end = bl_end
+
+    current_entries = _load_entries(list(paths), log_format, start, end)
+    baseline_entries = _load_entries(list(paths), log_format, baseline_start, baseline_end)
+
+    if not current_entries and not baseline_entries:
+        click.echo(Fore.RED + "两个时段均无日志数据" + Style.RESET_ALL)
+        sys.exit(1)
+
+    click.echo(Fore.CYAN + Style.BRIGHT + "=" * 70 + Style.RESET_ALL)
+    click.echo(Fore.CYAN + Style.BRIGHT + "  基线对比分析" + Style.RESET_ALL)
+    click.echo(Fore.CYAN + Style.BRIGHT + "=" * 70 + Style.RESET_ALL)
+    click.echo()
+    click.echo(f"  当前时段: {start or 'N/A'} ~ {end or 'N/A'}  ({len(current_entries)}条)")
+    click.echo(f"  基线时段: {baseline_start} ~ {baseline_end}  ({len(baseline_entries)}条)")
+    click.echo()
+
+    cur_ips = defaultdict(int)
+    cur_paths = defaultdict(int)
+    cur_status = defaultdict(int)
+    cur_path_by_ip = defaultdict(set)
+
+    for e in current_entries:
+        cur_ips[e.ip] += 1
+        cur_paths[e.path] += 1
+        cur_status[e.status] += 1
+        cur_path_by_ip[e.ip].add(e.path)
+
+    bl_ips = defaultdict(int)
+    bl_paths = defaultdict(int)
+    bl_status = defaultdict(int)
+    bl_path_by_ip = defaultdict(set)
+
+    for e in baseline_entries:
+        bl_ips[e.ip] += 1
+        bl_paths[e.path] += 1
+        bl_status[e.status] += 1
+        bl_path_by_ip[e.ip].add(e.path)
+
+    # 1. 新增IP
+    new_ips = set(cur_ips.keys()) - set(bl_ips.keys())
+    if new_ips:
+        click.echo(Fore.RED + Style.BRIGHT + "  > 新增IP (基线中未出现):" + Style.RESET_ALL)
+        sorted_new = sorted(new_ips, key=lambda ip: cur_ips[ip], reverse=True)[:limit]
+        for ip in sorted_new:
+            click.echo(f"    {ip:18s} {cur_ips[ip]:>5d}次  "
+                       f"路径数: {len(cur_path_by_ip[ip])}")
+        click.echo()
+
+    # 2. 异常增长IP
+    growth_ips = []
+    all_ips = set(cur_ips.keys()) & set(bl_ips.keys())
+    for ip in all_ips:
+        if bl_ips[ip] == 0:
+            continue
+        ratio = cur_ips[ip] / bl_ips[ip]
+        if ratio >= 2.0 and cur_ips[ip] >= 5:
+            growth_ips.append((ip, cur_ips[ip], bl_ips[ip], ratio))
+    growth_ips.sort(key=lambda x: x[3], reverse=True)
+
+    if growth_ips:
+        click.echo(Fore.YELLOW + Style.BRIGHT + "  > 异常增长IP (同比>=2倍):" + Style.RESET_ALL)
+        for ip, cur, bl, ratio in growth_ips[:limit]:
+            click.echo(f"    {ip:18s} {bl:>4d} -> {cur:>4d}  "
+                       f"{Fore.RED}{ratio:.1f}x{Style.RESET_ALL}")
+        click.echo()
+
+    # 3. 新增路径
+    new_paths = set(cur_paths.keys()) - set(bl_paths.keys())
+    if new_paths:
+        click.echo(Fore.RED + Style.BRIGHT + "  > 新增路径 (基线中未出现):" + Style.RESET_ALL)
+        sorted_np = sorted(new_paths, key=lambda p: cur_paths[p], reverse=True)[:limit]
+        for path in sorted_np:
+            p = path if len(path) <= 55 else path[:52] + "..."
+            click.echo(f"    {cur_paths[path]:>4d}次  {p}")
+        click.echo()
+
+    # 4. 高危新增路径(用规则扫描)
+    if new_paths:
+        engine = RuleEngine()
+        if not no_default_rules:
+            engine.load_default_rules()
+        if rules_file:
+            engine.load_rules_file(rules_file)
+
+        new_path_entries = [e for e in current_entries if e.path in new_paths]
+        if new_path_entries:
+            new_matches = engine.scan_entries(new_path_entries)
+            high_new = [m for m in new_matches if m.rule.severity in ("critical", "high")]
+            if high_new:
+                click.echo(Fore.RED + Style.BRIGHT + "  > 高危新增路径 (命中规则):" + Style.RESET_ALL)
+                seen = set()
+                for m in high_new:
+                    key = (m.entry.path, m.rule.name)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    sev_color = SEVERITY_COLORS.get(m.rule.severity, "")
+                    sev_tag = SEVERITY_TAGS.get(m.rule.severity, "")
+                    click.echo(f"    {sev_color}{sev_tag}{Style.RESET_ALL} "
+                               f"{m.rule.name}  {m.entry.path[:50]}")
+                click.echo()
+
+    # 5. 状态码变化
+    click.echo(Fore.YELLOW + Style.BRIGHT + "  > 状态码分布对比:" + Style.RESET_ALL)
+    all_status = sorted(set(list(cur_status.keys()) + list(bl_status.keys())))
+    for s in all_status:
+        c = cur_status.get(s, 0)
+        b = bl_status.get(s, 0)
+        if s >= 500:
+            color = Fore.RED
+        elif s >= 400:
+            color = Fore.YELLOW
+        else:
+            color = Fore.GREEN
+        diff = c - b
+        diff_str = f"{Fore.RED}+{diff}" if diff > 0 else (
+            f"{Fore.GREEN}{diff}" if diff < 0 else f"  0")
+        if b > 0:
+            pct = (c - b) / b * 100
+            pct_str = f" ({pct:+.0f}%)" if abs(pct) >= 10 else ""
+        else:
+            pct_str = " (NEW)" if c > 0 else ""
+        click.echo(f"    {color}{s}{Style.RESET_ALL}: "
+                   f"基线 {b:>5d} -> 当前 {c:>5d}  {diff_str}{pct_str}{Style.RESET_ALL}")
+    click.echo()
+
+    # 6. 总体摘要
+    total_delta = len(current_entries) - len(baseline_entries)
+    delta_color = Fore.RED if total_delta > 0 else (Fore.GREEN if total_delta < 0 else "")
+    click.echo(Fore.CYAN + Style.BRIGHT + "  总体摘要:" + Style.RESET_ALL)
+    click.echo(f"    请求数变化: {delta_color}{len(baseline_entries)} -> "
+               f"{len(current_entries)} ({total_delta:+d}){Style.RESET_ALL}")
+    click.echo(f"    新增IP:     {Fore.RED}{len(new_ips)}{Style.RESET_ALL}  "
+               f"增长IP: {Fore.YELLOW}{len(growth_ips)}{Style.RESET_ALL}  "
+               f"新增路径: {Fore.RED}{len(new_paths)}{Style.RESET_ALL}")
+
+
+def _shift_time(start, end, shift_str):
+    """根据偏移量推算基线时段"""
+    if not start or not end:
+        return None, None
+
+    from logalyzer.parser import _parse_datetime
+    start_dt = _parse_datetime(start)
+    end_dt = _parse_datetime(end)
+    if not start_dt or not end_dt:
+        return None, None
+
+    delta = _parse_shift(shift_str)
+    if delta is None:
+        return None, None
+
+    bl_start_dt = start_dt - delta
+    bl_end_dt = end_dt - delta
+
+    fmt = "%Y-%m-%d %H:%M:%S" if " " in start else "%Y-%m-%d"
+    return bl_start_dt.strftime(fmt), bl_end_dt.strftime(fmt)
+
+
+def _parse_shift(shift_str):
+    """解析时间偏移字符串(如1d,2h,30m)"""
+    from datetime import timedelta
+    m = re.match(r'^(\d+)([dhm])$', shift_str.lower())
+    if not m:
+        return None
+    val = int(m.group(1))
+    unit = m.group(2)
+    if unit == 'd':
+        return timedelta(days=val)
+    elif unit == 'h':
+        return timedelta(hours=val)
+    elif unit == 'm':
+        return timedelta(minutes=val)
+    return None
 
 
 @cli.group()
