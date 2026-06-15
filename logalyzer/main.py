@@ -1,6 +1,9 @@
 import sys
 import os
 import re
+import time
+from datetime import datetime
+from collections import deque, defaultdict
 from typing import List, Optional
 
 import click
@@ -15,7 +18,7 @@ from .parser import (
 )
 from .rules import RuleEngine, RuleMatch
 from .config import ConfigManager
-from .exporter import Exporter, _format_size
+from .exporter import Exporter, _format_size, group_matches, get_disposition, risk_level
 
 
 init(autoreset=True)
@@ -26,6 +29,14 @@ SEVERITY_COLORS = {
     "medium": Fore.YELLOW,
     "low": Fore.CYAN,
     "warning": Fore.MAGENTA,
+}
+
+SEVERITY_TAGS = {
+    "critical": "[严重]",
+    "high": "[高危]",
+    "medium": "[中危]",
+    "low": "[低危]",
+    "warning": "[警告]",
 }
 
 
@@ -133,17 +144,35 @@ def cli(ctx):
 @click.option("--category", default=None, help="只显示指定分类的告警")
 @click.option("-n", "--limit", default=20, help="显示的告警数量，默认: 20")
 @click.option("--page", default=1, help="页码，默认: 1")
-@click.option("--page-size", default=None, help="每页大小")
+@click.option("--page-size", default=None, type=int, help="每页大小")
 @click.option("-k", "--highlight", multiple=True, help="关键字高亮，可多次指定")
 @click.option("--summary/--no-summary", default=True, help="是否显示摘要")
 @click.option("--export", "export_file", default=None, help="导出结果到CSV文件")
 @click.option("--report", "report_file", default=None, help="生成排查报告")
+@click.option("--profile", default=None, help="使用配置档案")
 @click.pass_context
 def scan(ctx, paths, log_format, start, end, rules_file, no_default_rules,
          severity, category, limit, page, page_size, highlight, summary,
-         export_file, report_file):
+         export_file, report_file, profile):
     """扫描日志，检测异常访问和攻击行为"""
     config = ctx.obj["config"]
+
+    if profile:
+        prof = config.load_profile(profile)
+        if prof:
+            if not paths and "paths" in prof:
+                paths = tuple(prof["paths"])
+            if not log_format and "format" in prof:
+                log_format = prof["format"]
+            if not start and "start" in prof:
+                start = prof["start"]
+            if not end and "end" in prof:
+                end = prof["end"]
+            if not rules_file and "rules_file" in prof:
+                rules_file = prof["rules_file"]
+        else:
+            click.echo(Fore.YELLOW + f"警告: 配置档案 '{profile}' 不存在" + Style.RESET_ALL)
+
     log_format = log_format or config.get("default_format", "combined")
     page_size = page_size or config.get("page_size", 20)
 
@@ -186,15 +215,23 @@ def scan(ctx, paths, log_format, start, end, rules_file, no_default_rules,
         match_summary = engine.match_summary(matches)
         data_summary = compute_summary(entries)
 
-        click.echo(Fore.CYAN + Style.BRIGHT + "=" * 60 + Style.RESET_ALL)
+        click.echo(Fore.CYAN + Style.BRIGHT + "=" * 70 + Style.RESET_ALL)
         click.echo(Fore.CYAN + Style.BRIGHT + "  日志扫描结果" + Style.RESET_ALL)
-        click.echo(Fore.CYAN + Style.BRIGHT + "=" * 60 + Style.RESET_ALL)
+        click.echo(Fore.CYAN + Style.BRIGHT + "=" * 70 + Style.RESET_ALL)
         click.echo()
         click.echo(f"  解析日志条目: {data_summary['total_requests']} 条")
         click.echo(f"  加载规则数量: {rules_summary['enabled']} 条")
+        critical_count = match_summary["by_severity"].get("critical", 0)
+        high_count = match_summary["by_severity"].get("high", 0)
+        risk = risk_level(match_summary["total_matches"], critical_count, high_count)
+        risk_color = Fore.RED + Style.BRIGHT if risk in ("极高", "高") else (
+            Fore.YELLOW if risk == "中" else Fore.GREEN)
         click.echo(f"  告警总数:     {Fore.RED if match_summary['total_matches'] > 0 else ''}"
-                   f"{match_summary['total_matches']} 条{Style.RESET_ALL}")
+                   f"{match_summary['total_matches']} 条{Style.RESET_ALL}"
+                   f"   {risk_color}风险等级: {risk}{Style.RESET_ALL}")
         click.echo(f"  涉及IP数:     {match_summary['unique_ips']} 个")
+        click.echo(f"  时间范围:     {data_summary['time_range_start']} ~ "
+                   f"{data_summary['time_range_end']}")
         click.echo()
 
         click.echo(Fore.YELLOW + "  按严重级别:" + Style.RESET_ALL)
@@ -202,7 +239,11 @@ def scan(ctx, paths, log_format, start, end, rules_file, no_default_rules,
             count = match_summary["by_severity"].get(sev, 0)
             if count > 0:
                 color = SEVERITY_COLORS.get(sev, "")
-                click.echo(f"    {color}{sev:10s}{Style.RESET_ALL}: {count} 条")
+                tag = SEVERITY_TAGS.get(sev, "")
+                click.echo(f"    {color}{tag}{sev:10s}{Style.RESET_ALL}: {count} 条")
+        click.echo()
+
+        _print_scan_summary(matches)
         click.echo()
 
     total_matches = len(matches)
@@ -263,17 +304,35 @@ def scan(ctx, paths, log_format, start, end, rules_file, no_default_rules,
 @click.option("--ip", "ips", default=None, help="IP过滤，逗号分隔")
 @click.option("-n", "--limit", default=20, help="显示数量，默认: 20")
 @click.option("--page", default=1, help="页码，默认: 1")
-@click.option("--page-size", default=None, help="每页大小")
+@click.option("--page-size", default=None, type=int, help="每页大小")
 @click.option("--highlight", multiple=True, help="关键字高亮，可多次指定")
 @click.option("-v", "--verbose", is_flag=True, help="显示详细信息")
 @click.option("--summary/--no-summary", default=True, help="是否显示摘要")
 @click.option("--export", "export_file", default=None, help="导出结果到CSV/TXT文件")
+@click.option("--profile", default=None, help="使用配置档案")
 @click.pass_context
 def filter(ctx, paths, log_format, start, end, keyword, regex, field,
            status_codes, ips, limit, page, page_size, highlight, verbose,
-           summary, export_file):
+           summary, export_file, profile):
     """按条件过滤日志，支持时间、关键字、正则、状态码、IP等过滤"""
     config = ctx.obj["config"]
+
+    if profile:
+        prof = config.load_profile(profile)
+        if prof:
+            if not paths and "paths" in prof:
+                paths = tuple(prof["paths"])
+            if not log_format and "format" in prof:
+                log_format = prof["format"]
+            if not start and "start" in prof:
+                start = prof["start"]
+            if not end and "end" in prof:
+                end = prof["end"]
+            if not keyword and "keyword" in prof:
+                keyword = prof["keyword"]
+        else:
+            click.echo(Fore.YELLOW + f"警告: 配置档案 '{profile}' 不存在" + Style.RESET_ALL)
+
     log_format = log_format or config.get("default_format", "combined")
     page_size = page_size or config.get("page_size", 20)
 
@@ -357,11 +416,27 @@ def filter(ctx, paths, log_format, start, end, keyword, regex, field,
 @click.option("--threshold", default=100, help="高频请求阈值，默认: 100")
 @click.option("--window", default=60, help="检测时间窗口(秒)，默认: 60")
 @click.option("--export", "export_file", default=None, help="导出结果到CSV")
+@click.option("--profile", default=None, help="使用配置档案")
 @click.pass_context
 def top(ctx, paths, log_format, start, end, stat_type, limit, min_count,
-        high_freq, threshold, window, export_file):
+        high_freq, threshold, window, export_file, profile):
     """按IP、状态码、路径等聚合统计，显示TOP排名和高频请求"""
     config = ctx.obj["config"]
+
+    if profile:
+        prof = config.load_profile(profile)
+        if prof:
+            if not paths and "paths" in prof:
+                paths = tuple(prof["paths"])
+            if not log_format and "format" in prof:
+                log_format = prof["format"]
+            if not start and "start" in prof:
+                start = prof["start"]
+            if not end and "end" in prof:
+                end = prof["end"]
+        else:
+            click.echo(Fore.YELLOW + f"警告: 配置档案 '{profile}' 不存在" + Style.RESET_ALL)
+
     log_format = log_format or config.get("default_format", "combined")
 
     default_paths = config.get("default_log_paths", [])
@@ -494,14 +569,30 @@ def top(ctx, paths, log_format, start, end, stat_type, limit, min_count,
 @click.option("--end", default=None, help="结束时间")
 @click.option("-n", "--limit", default=50, help="显示条目数限制")
 @click.option("--page", default=1, help="页码")
-@click.option("--page-size", default=None, help="每页大小")
+@click.option("--page-size", default=None, type=int, help="每页大小")
 @click.option("-k", "--highlight", multiple=True, help="关键字高亮")
 @click.option("--export", "export_file", default=None, help="导出到CSV/TXT")
+@click.option("--profile", default=None, help="使用配置档案")
 @click.pass_context
 def trace(ctx, ip, paths, log_format, start, end, limit, page, page_size,
-          highlight, export_file):
+          highlight, export_file, profile):
     """追踪单个IP的完整访问会话链路"""
     config = ctx.obj["config"]
+
+    if profile:
+        prof = config.load_profile(profile)
+        if prof:
+            if not paths and "paths" in prof:
+                paths = tuple(prof["paths"])
+            if not log_format and "format" in prof:
+                log_format = prof["format"]
+            if not start and "start" in prof:
+                start = prof["start"]
+            if not end and "end" in prof:
+                end = prof["end"]
+        else:
+            click.echo(Fore.YELLOW + f"警告: 配置档案 '{profile}' 不存在" + Style.RESET_ALL)
+
     log_format = log_format or config.get("default_format", "combined")
     page_size = page_size or config.get("page_size", 20)
 
@@ -599,11 +690,29 @@ def trace(ctx, ip, paths, log_format, start, end, limit, page, page_size,
 @click.option("--scan/--no-scan", default=False, help="是否包含异常扫描结果")
 @click.option("--rules", "rules_file", default=None, help="异常规则配置文件路径")
 @click.option("--no-default-rules", is_flag=True, help="不加载内置规则")
+@click.option("--profile", default=None, help="使用配置档案")
 @click.pass_context
 def export(ctx, paths, log_format, start, end, keyword, regex, status_codes,
-           ips, export_type, output, output_dir, scan, rules_file, no_default_rules):
+           ips, export_type, output, output_dir, scan, rules_file, no_default_rules, profile):
     """导出分析结果，支持CSV、文本、JSON和排查报告格式"""
     config = ctx.obj["config"]
+
+    if profile:
+        prof = config.load_profile(profile)
+        if prof:
+            if not paths and "paths" in prof:
+                paths = tuple(prof["paths"])
+            if not log_format and "format" in prof:
+                log_format = prof["format"]
+            if not start and "start" in prof:
+                start = prof["start"]
+            if not end and "end" in prof:
+                end = prof["end"]
+            if not rules_file and "rules_file" in prof:
+                rules_file = prof["rules_file"]
+        else:
+            click.echo(Fore.YELLOW + f"警告: 配置档案 '{profile}' 不存在" + Style.RESET_ALL)
+
     log_format = log_format or config.get("default_format", "combined")
     export_dir = output_dir or config.get("export_dir")
 
@@ -656,6 +765,298 @@ def export(ctx, paths, log_format, start, end, keyword, regex, status_codes,
     click.echo(f"  条目数: {len(entries)}")
     if scan and matches:
         click.echo(f"  告警数: {len(matches)}")
+
+
+def _print_scan_summary(matches: List[RuleMatch]):
+    """在终端输出扫描结果的分组摘要"""
+    if not matches:
+        click.echo(Fore.GREEN + "  未检测到异常访问" + Style.RESET_ALL)
+        return
+
+    grouped = group_matches(matches)
+    total = len(matches)
+
+    click.echo(Fore.YELLOW + Style.BRIGHT + "  > 攻击类型统计:" + Style.RESET_ALL)
+    attack_sorted = sorted(grouped["by_attack"].items(),
+                           key=lambda x: len(x[1]), reverse=True)
+    for i, (attack_name, attack_matches) in enumerate(attack_sorted[:10], 1):
+        disp = get_disposition(attack_name)
+        uniq_ips = len(set(m.entry.ip for m in attack_matches))
+        max_sev = max((m.rule.severity for m in attack_matches),
+                      key=lambda s: {"critical": 4, "high": 3, "medium": 2,
+                                     "low": 1, "warning": 0}.get(s, 0))
+        sev_color = SEVERITY_COLORS.get(max_sev, "")
+        sev_tag = SEVERITY_TAGS.get(max_sev, "")
+        click.echo(f"    [{i:2d}] {sev_color}{sev_tag}{Style.RESET_ALL} "
+                   f"{attack_name:28s} {len(attack_matches):>4d}次  "
+                   f"{uniq_ips:>2d}IP  {disp['threat']}")
+    click.echo()
+
+    click.echo(Fore.YELLOW + Style.BRIGHT + "  > 攻击源IP (TOP 8):" + Style.RESET_ALL)
+    ip_sorted = sorted(grouped["by_ip"].items(),
+                       key=lambda x: len(x[1]), reverse=True)
+    for i, (ip, ip_matches) in enumerate(ip_sorted[:8], 1):
+        sevs = defaultdict(int)
+        attacks = set()
+        for m in ip_matches:
+            sevs[m.rule.severity] += 1
+            attacks.add(m.rule.name)
+        max_sev = max(sevs.keys(),
+                      key=lambda s: {"critical": 4, "high": 3, "medium": 2,
+                                     "low": 1, "warning": 0}.get(s, 0))
+        sev_color = SEVERITY_COLORS.get(max_sev, "")
+        sev_str = " ".join(f"{k}:{v}" for k, v in sorted(sevs.items()))
+        click.echo(f"    [{i:2d}] {sev_color}{ip:18s}{Style.RESET_ALL}  "
+                   f"{len(ip_matches):>3d}条  {sev_str}")
+        click.echo(f"         攻击: {', '.join(sorted(attacks)[:4])}")
+    click.echo()
+
+    click.echo(Fore.YELLOW + Style.BRIGHT + "  > 受影响路径 (TOP 8):" + Style.RESET_ALL)
+    path_sorted = sorted(grouped["by_path"].items(),
+                         key=lambda x: len(x[1]), reverse=True)
+    for i, (path, path_matches) in enumerate(path_sorted[:8], 1):
+        uniq_ips = len(set(m.entry.ip for m in path_matches))
+        max_sev = max((m.rule.severity for m in path_matches),
+                      key=lambda s: {"critical": 4, "high": 3, "medium": 2,
+                                     "low": 1, "warning": 0}.get(s, 0))
+        sev_color = SEVERITY_COLORS.get(max_sev, "")
+        sev_tag = SEVERITY_TAGS.get(max_sev, "")
+        display_path = path if len(path) <= 48 else path[:45] + "..."
+        click.echo(f"    [{i:2d}] {sev_color}{sev_tag}{Style.RESET_ALL} "
+                   f"{len(path_matches):>3d}次 {uniq_ips:>2d}IP  {display_path}")
+    click.echo()
+
+    critical_count = sum(1 for m in matches if m.rule.severity == "critical")
+    high_count = sum(1 for m in matches if m.rule.severity == "high")
+    risk = risk_level(total, critical_count, high_count)
+    risk_color = Fore.RED + Style.BRIGHT if risk in ("极高", "高") else (
+        Fore.YELLOW if risk == "中" else Fore.GREEN)
+    click.echo(f"  {risk_color}综合风险等级: {risk}{Style.RESET_ALL}")
+
+    if critical_count > 0 or high_count > 0:
+        click.echo()
+        click.echo(Fore.RED + Style.BRIGHT + "  ! 处置建议 (高危告警):" + Style.RESET_ALL)
+        attack_displayed = set()
+        for attack_name, _ in attack_sorted:
+            if attack_name in attack_displayed:
+                continue
+            disp = get_disposition(attack_name)
+            top_matches = [m for m in matches if m.rule.name == attack_name]
+            max_sev = max((m.rule.severity for m in top_matches),
+                          key=lambda s: {"critical": 4, "high": 3, "medium": 2,
+                                         "low": 1, "warning": 0}.get(s, 0))
+            if max_sev not in ("critical", "high"):
+                continue
+            attack_displayed.add(attack_name)
+            sev_color = SEVERITY_COLORS.get(max_sev, "")
+            click.echo(f"    {sev_color}* {disp['threat']}{Style.RESET_ALL}")
+            for action in disp["actions"][:3]:
+                click.echo(f"      · {action}")
+            if len(attack_displayed) >= 3:
+                break
+
+
+@cli.command()
+@click.argument("paths", nargs=-1)
+@click.option("-f", "--format", "log_format", default=None, help="日志格式")
+@click.option("-r", "--rules", "rules_file", default=None, help="异常规则配置文件")
+@click.option("--no-default-rules", is_flag=True, help="不加载内置规则")
+@click.option("--severity", default=None,
+              help="只显示指定严重级别的告警 (critical/high/medium/low)")
+@click.option("--ip", "watch_ips", default=None, help="只监控指定IP，逗号分隔")
+@click.option("--high-only", is_flag=True, help="只显示高危及以上告警 (critical/high)")
+@click.option("--interval", default=1.0, type=float, help="文件读取间隔(秒)，默认: 1.0")
+@click.option("--threshold", default=30, type=int,
+              help="高频请求告警阈值(次/分钟)，默认: 30")
+@click.option("--no-stats", is_flag=True, help="不显示实时统计栏")
+@click.option("--profile", default=None, help="使用配置档案")
+@click.pass_context
+def watch(ctx, paths, log_format, rules_file, no_default_rules, severity,
+          watch_ips, high_only, interval, threshold, no_stats, profile):
+    """实时监控日志文件，滚动显示异常告警和高频请求"""
+    config = ctx.obj["config"]
+
+    if profile:
+        prof = config.load_profile(profile)
+        if prof:
+            if not paths and "paths" in prof:
+                paths = tuple(prof["paths"])
+            if not log_format and "format" in prof:
+                log_format = prof["format"]
+            if not rules_file and "rules_file" in prof:
+                rules_file = prof["rules_file"]
+        else:
+            click.echo(Fore.YELLOW + f"警告: 配置档案 '{profile}' 不存在" + Style.RESET_ALL)
+
+    log_format = log_format or config.get("default_format", "combined")
+    default_paths = config.get("default_log_paths", [])
+    if not paths and default_paths:
+        paths = tuple(default_paths)
+
+    if not paths:
+        click.echo(Fore.RED + "请指定日志文件或目录路径" + Style.RESET_ALL)
+        sys.exit(1)
+
+    files = resolve_paths(list(paths))
+    if not files:
+        click.echo(Fore.RED + "未找到任何日志文件" + Style.RESET_ALL)
+        sys.exit(1)
+
+    engine = RuleEngine()
+    if not no_default_rules:
+        engine.load_default_rules()
+    if rules_file:
+        engine.load_rules_file(rules_file)
+    else:
+        for rf in config.get("rules_files", []):
+            engine.load_rules_file(rf)
+
+    ip_filter = None
+    if watch_ips:
+        ip_filter = [ip.strip() for ip in watch_ips.split(",") if ip.strip()]
+
+    parser = LogParser(log_format=log_format)
+    file_positions = {}
+    for fp in files:
+        try:
+            file_positions[fp] = os.path.getsize(fp)
+        except OSError:
+            file_positions[fp] = 0
+
+    ip_window: Dict[str, deque] = defaultdict(lambda: deque(maxlen=threshold * 2))
+    total_alerts = 0
+    total_requests = 0
+    alerted_ips = set()
+    start_time = datetime.now()
+
+    click.echo(Fore.CYAN + Style.BRIGHT + "=" * 70 + Style.RESET_ALL)
+    click.echo(Fore.CYAN + Style.BRIGHT + "  日志实时监控模式 - Logalyzer Watch" + Style.RESET_ALL)
+    click.echo(Fore.CYAN + Style.BRIGHT + "=" * 70 + Style.RESET_ALL)
+    click.echo()
+    click.echo(f"  监控文件: {len(files)} 个")
+    for f in files:
+        click.echo(f"    - {f}")
+    click.echo(f"  加载规则: {len(engine.rules)} 条")
+    click.echo(f"  扫描间隔: {interval}s")
+    click.echo(f"  高频阈值: {threshold}次/分钟")
+    if high_only:
+        click.echo(f"  过滤模式: 仅高危及以上")
+    if severity:
+        click.echo(f"  过滤级别: {severity}")
+    if ip_filter:
+        click.echo(f"  监控IP: {', '.join(ip_filter)}")
+    click.echo()
+    click.echo(Fore.YELLOW + "  按 Ctrl+C 退出监控" + Style.RESET_ALL)
+    click.echo()
+
+    try:
+        while True:
+            batch_matches: List[RuleMatch] = []
+
+            for fp in files:
+                try:
+                    current_size = os.path.getsize(fp)
+                except OSError:
+                    continue
+
+                last_pos = file_positions.get(fp, 0)
+                if current_size < last_pos:
+                    file_positions[fp] = 0
+                    last_pos = 0
+
+                if current_size > last_pos:
+                    try:
+                        with open(fp, "r", encoding="utf-8", errors="ignore") as f:
+                            f.seek(last_pos)
+                            new_lines = f.readlines()
+                        file_positions[fp] = current_size
+
+                        for line in new_lines:
+                            entry = parser.parse_line(line, os.path.basename(fp))
+                            if not entry:
+                                continue
+
+                            total_requests += 1
+
+                            if ip_filter and entry.ip not in ip_filter:
+                                continue
+
+                            if entry.timestamp:
+                                ip_window[entry.ip].append(entry.timestamp.timestamp())
+
+                            if threshold > 0 and entry.ip not in alerted_ips:
+                                recent = [t for t in ip_window[entry.ip]
+                                          if time.time() - t <= 60]
+                                if len(recent) >= threshold:
+                                    alerted_ips.add(entry.ip)
+                                    ts = entry.timestamp.strftime("%H:%M:%S") if entry.timestamp else "??:??:??"
+                                    click.echo(
+                                        Fore.RED + Style.BRIGHT +
+                                        f"  ! [{ts}] [高频] IP {entry.ip} 触发高频请求 "
+                                        f"({len(recent)}次/分钟)" +
+                                        Style.RESET_ALL
+                                    )
+
+                            matches = engine.scan_entry(entry)
+                            for m in matches:
+                                if high_only and m.rule.severity not in ("critical", "high"):
+                                    continue
+                                if severity and m.rule.severity != severity:
+                                    continue
+                                batch_matches.append(m)
+                                total_alerts += 1
+
+                                sev_color = SEVERITY_COLORS.get(m.rule.severity, "")
+                                sev_tag = SEVERITY_TAGS.get(m.rule.severity, "")
+                                ts = m.entry.timestamp.strftime("%H:%M:%S") if m.entry.timestamp else "??:??:??"
+                                disp = get_disposition(m.rule.name)
+                                click.echo(
+                                    f"  {sev_color}{sev_tag}{Style.RESET_ALL} "
+                                    f"{Fore.CYAN}[{ts}]{Style.RESET_ALL} "
+                                    f"{m.entry.ip:15s}  {m.entry.method:4s} "
+                                    f"{m.entry.status:>3d}  {m.rule.name}"
+                                )
+                                click.echo(
+                                    f"       {m.entry.path[:70]}"
+                                )
+                                if m.rule.severity in ("critical", "high"):
+                                    click.echo(
+                                        f"       {Fore.MAGENTA}威胁:{Style.RESET_ALL} "
+                                        f"{disp['threat']} | "
+                                        f"{Fore.MAGENTA}建议:{Style.RESET_ALL} "
+                                        f"{disp['actions'][0]}"
+                                    )
+                                click.echo()
+
+                    except (IOError, OSError):
+                        continue
+
+            if not no_stats and (total_requests % 50 == 0 or total_alerts % 5 == 0) and total_requests > 0:
+                elapsed = (datetime.now() - start_time).total_seconds()
+                click.echo(
+                    Fore.CYAN + Style.DIM +
+                    f"  ── 统计: 已处理 {total_requests} 条 | "
+                    f"告警 {total_alerts} 条 | "
+                    f"运行 {int(elapsed)}s ──" +
+                    Style.RESET_ALL
+                )
+
+            time.sleep(interval)
+
+    except KeyboardInterrupt:
+        click.echo()
+        click.echo()
+        click.echo(Fore.CYAN + Style.BRIGHT + "=" * 70 + Style.RESET_ALL)
+        click.echo(Fore.CYAN + Style.BRIGHT + "  监控结束" + Style.RESET_ALL)
+        click.echo(Fore.CYAN + Style.BRIGHT + "=" * 70 + Style.RESET_ALL)
+        elapsed = (datetime.now() - start_time).total_seconds()
+        click.echo()
+        click.echo(f"  运行时长: {int(elapsed)} 秒")
+        click.echo(f"  处理请求: {total_requests} 条")
+        click.echo(f"  触发告警: {total_alerts} 条")
+        if alerted_ips:
+            click.echo(f"  高频IP:   {', '.join(sorted(alerted_ips))}")
+        click.echo()
 
 
 @cli.group()
@@ -803,8 +1204,12 @@ def config_remove_rules(ctx, filepath):
 @click.option("--format", "log_format", default=None, help="日志格式")
 @click.option("--start", default=None, help="默认开始时间")
 @click.option("--end", default=None, help="默认结束时间")
+@click.option("--rules", "rules_file", default=None, help="异常规则配置文件路径")
+@click.option("--keyword", default=None, help="默认关键字过滤")
+@click.option("--ip", default=None, help="默认IP过滤，逗号分隔")
+@click.option("--status", default=None, help="默认状态码过滤，逗号分隔")
 @click.pass_context
-def config_save_profile(ctx, name, paths, log_format, start, end):
+def config_save_profile(ctx, name, paths, log_format, start, end, rules_file, keyword, ip, status):
     """保存常用参数为配置档案"""
     config = ctx.obj["config"]
     profile = {}
@@ -816,6 +1221,14 @@ def config_save_profile(ctx, name, paths, log_format, start, end):
         profile["start"] = start
     if end:
         profile["end"] = end
+    if rules_file:
+        profile["rules_file"] = rules_file
+    if keyword:
+        profile["keyword"] = keyword
+    if ip:
+        profile["ips"] = [x.strip() for x in ip.split(",")]
+    if status:
+        profile["status_codes"] = status
 
     if not profile:
         click.echo(Fore.YELLOW + "请至少指定一个参数" + Style.RESET_ALL)

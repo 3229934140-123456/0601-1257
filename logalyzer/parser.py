@@ -1,7 +1,7 @@
 import re
 import os
 import glob
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from collections import defaultdict
 from typing import List, Dict, Optional, Iterator, Tuple
 
@@ -14,7 +14,7 @@ LOG_FORMATS = {
         r'\[(?P<time>[^\]]+)\]\s+'
         r'"(?P<method>\S+)\s+(?P<path>\S+)\s+(?P<protocol>[^"]+)"\s+'
         r'(?P<status>\d+)\s+'
-        r'(?P<size>\d+)\s+'
+        r'(?P<size>\d+|-)\s+'
         r'"(?P<referer>[^"]*)"\s+'
         r'"(?P<user_agent>[^"]*)"'
     ),
@@ -25,16 +25,19 @@ LOG_FORMATS = {
         r'\[(?P<time>[^\]]+)\]\s+'
         r'"(?P<method>\S+)\s+(?P<path>\S+)\s+(?P<protocol>[^"]+)"\s+'
         r'(?P<status>\d+)\s+'
-        r'(?P<size>\d+)'
+        r'(?P<size>\d+|-)'
     ),
 }
 
 TIME_FORMATS = [
     "%d/%b/%Y:%H:%M:%S %z",
     "%d/%b/%Y:%H:%M:%S",
+    "%Y-%m-%d %H:%M:%S %z",
     "%Y-%m-%d %H:%M:%S",
-    "%Y-%m-%dT%H:%M:%S",
     "%Y-%m-%dT%H:%M:%S%z",
+    "%Y-%m-%dT%H:%M:%S",
+    "%Y-%m-%d %H:%M",
+    "%Y-%m-%d",
 ]
 
 
@@ -75,8 +78,11 @@ class LogEntry:
     @property
     def size(self) -> int:
         try:
-            return int(self.data.get("size", 0))
-        except ValueError:
+            val = self.data.get("size", "0")
+            if val == "-":
+                return 0
+            return int(val)
+        except (ValueError, TypeError):
             return 0
 
     @property
@@ -141,32 +147,48 @@ def resolve_paths(paths: List[str]) -> List[str]:
     return sorted(set(files))
 
 
+def _parse_datetime(s: str) -> Optional[datetime]:
+    """解析日期时间字符串，返回带时区或不带时区的datetime"""
+    if not s:
+        return None
+    for fmt in TIME_FORMATS:
+        try:
+            return datetime.strptime(s, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def _cmp_datetime(a: datetime, b: datetime) -> int:
+    """安全比较两个datetime，自动处理时区差异。
+    当一个有tz一个无时，将naive一方解释为与aware一方相同的时区（而非默认UTC），
+    以符合值班人员'按日志显示时间'筛选的直觉。
+    """
+    a_aware = a.tzinfo is not None and a.tzinfo.utcoffset(a) is not None
+    b_aware = b.tzinfo is not None and b.tzinfo.utcoffset(b) is not None
+    if a_aware and not b_aware:
+        b = b.replace(tzinfo=a.tzinfo)
+    elif b_aware and not a_aware:
+        a = a.replace(tzinfo=b.tzinfo)
+    if a < b:
+        return -1
+    elif a > b:
+        return 1
+    return 0
+
+
 def filter_by_time(entries: Iterator[LogEntry], start: Optional[str] = None,
                    end: Optional[str] = None) -> Iterator[LogEntry]:
-    start_dt = None
-    end_dt = None
-    if start:
-        for fmt in TIME_FORMATS:
-            try:
-                start_dt = datetime.strptime(start, fmt)
-                break
-            except ValueError:
-                continue
-    if end:
-        for fmt in TIME_FORMATS:
-            try:
-                end_dt = datetime.strptime(end, fmt)
-                break
-            except ValueError:
-                continue
+    start_dt = _parse_datetime(start) if start else None
+    end_dt = _parse_datetime(end) if end else None
 
     for entry in entries:
         ts = entry.timestamp
         if ts is None:
             continue
-        if start_dt and ts < start_dt:
+        if start_dt and _cmp_datetime(ts, start_dt) < 0:
             continue
-        if end_dt and ts > end_dt:
+        if end_dt and _cmp_datetime(ts, end_dt) > 0:
             continue
         yield entry
 
